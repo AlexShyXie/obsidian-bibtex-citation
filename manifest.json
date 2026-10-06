@@ -1,10 +1,10 @@
 {
-	"id": "obsidian-citation-plugin",
-	"name": "Citations",
-	"version": "0.4.5",
-	"minAppVersion": "0.9.20",
-	"description": "Automatically search and insert citations from a Zotero library",
-	"author": "Jon Gauthier",
-	"authorUrl": "http://foldl.me",
+	"id": "bibtex-citation",
+	"name": "BibTeX Citations",
+	"version": "1.0.3",
+	"minAppVersion": "1.2.0",
+	"description": "Pandoc-style BibTeX citations with CSL rendering, @-suggest, and a right sidebar. Typora bibtex-citation features migrated onto the Citations plugin.",
+	"author": "AlexShyXie",
+	"authorUrl": "https://github.com/AlexShyXie",
 	"isDesktopOnly": true
 }

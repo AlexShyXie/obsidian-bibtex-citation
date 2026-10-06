@@ -1,38 +1,45 @@
 import {
+  Editor,
   FileSystemAdapter,
-  MarkdownSourceView,
   MarkdownView,
   normalizePath,
   Plugin,
   TFile,
+  WorkspaceLeaf,
 } from 'obsidian';
 import * as path from 'path';
 import * as chokidar from 'chokidar';
-import * as CodeMirror from 'codemirror';
 
-import {
-  compile as compileTemplate,
-  TemplateDelegate as Template,
-} from 'handlebars';
-
+import { compile as compileTemplate, TemplateDelegate as Template } from 'handlebars';
 
 import CitationEvents from './events';
 import {
-  InsertCitationModal,
-  InsertNoteLinkModal,
-  InsertNoteContentModal,
   OpenNoteModal,
+  InsertNoteContentModal,
 } from './modals';
 import { VaultExt } from './obsidian-extensions.d';
 import { CitationSettingTab, CitationsPluginSettings } from './settings';
 import {
   Entry,
-  EntryData,
+  EntryDataBibLaTeX,
   EntryBibLaTeXAdapter,
-  EntryCSLAdapter,
   IIndexable,
   Library,
 } from './types';
+import { BibCitationSuggest } from './suggest';
+import { BibPanelView, VIEW_TYPE_BIBTEX_CITATION } from './panel';
+import {
+  insertCitationCommand,
+  refreshCacheCommand,
+  renderCitationsCommand,
+  restoreCitationsCommand,
+  upsertBibliographyCommand,
+  removeBibliographyCommand,
+} from './commands';
+import { getBibCitationTexts, BibCitationTexts } from './v3/i18n';
+import { InternalBibEntry, toInternalEntries } from './bib-entries';
+import { CurrentDocumentState } from './v3/document/state';
+
 import {
   DISALLOWED_FILENAME_CHARACTERS_RE,
   Notifier,
@@ -63,12 +70,61 @@ export default class CitationPlugin extends Plugin {
     'Unable to access literature note. Please check that the literature note folder exists, or update the Citations plugin settings.',
   );
 
-  get editor(): CodeMirror.Editor {
-    const view = this.app.workspace.activeLeaf.view;
-    if (!(view instanceof MarkdownView)) return null;
+  get editor(): Editor | null {
+    return this.app.workspace.activeEditor?.editor ?? null;
+  }
 
-    const sourceView = view.sourceMode;
-    return (sourceView as MarkdownSourceView).cmEditor;
+  // ---- BibTeX Citations（Typora 版迁移）派生状态 ----
+
+  private internalEntriesCache: InternalBibEntry[] = [];
+  private internalEntriesSource: Library | null = null;
+  documentState = new CurrentDocumentState();
+
+  get texts(): BibCitationTexts {
+    // 与 Obsidian 界面语言对齐；运行时按 language 存储读取
+    return getBibCitationTexts(
+      String((window as unknown as { activeWindow?: { localStorage?: Storage } }).activeWindow?.localStorage?.getItem('language') ?? 'zh'),
+    );
+  }
+
+  getInternalBibEntries(): InternalBibEntry[] {
+    if (this.internalEntriesSource !== this.library) {
+      this.refreshDerivedEntries();
+    }
+    return this.internalEntriesCache;
+  }
+
+  refreshDerivedEntries(): void {
+    this.internalEntriesSource = this.library;
+    this.internalEntriesCache = this.library
+      ? toInternalEntries(Object.values(this.library.entries))
+      : [];
+  }
+
+  activeEditorView(): MarkdownView | null {
+    // 焦点在右侧栏/弹窗时 activeEditor 为 null，回退到最近活动的 Markdown 视图，
+    // 保证右侧栏按钮无需先点回正文即可作用于文档。
+    const active = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (active) {
+      this.lastMarkdownView = active;
+      return active;
+    }
+    if (this.lastMarkdownView && this.lastMarkdownView.editor) {
+      return this.lastMarkdownView;
+    }
+    return null;
+  }
+
+  private lastMarkdownView: MarkdownView | null = null;
+
+  getDocumentCitationState(markdown: string): {
+    counts: { unique: number; total: number };
+    error: { type: string; key?: string; blockText?: string } | null;
+  } {
+    const validKeys = new Set(
+      this.getInternalBibEntries().map((entry) => entry.key),
+    );
+    return this.documentState.getCitationState(markdown, validKeys);
   }
 
   async loadSettings(): Promise<void> {
@@ -79,12 +135,10 @@ export default class CitationPlugin extends Plugin {
 
     const toLoad = [
       'citationExportPath',
-      'citationExportFormat',
       'literatureNoteTitleTemplate',
       'literatureNoteFolder',
       'literatureNoteContentTemplate',
-      'markdownCitationTemplate',
-      'alternativeMarkdownCitationTemplate',
+      'cslFilePath',
     ];
     toLoad.forEach((setting) => {
       if (setting in loadedSettings) {
@@ -133,31 +187,39 @@ export default class CitationPlugin extends Plugin {
       // TODO show warning?
     }
 
+    // ---- BibTeX Citations（Typora 版迁移）----
+    this.registerEditorSuggest(new BibCitationSuggest(this));
+
+    this.registerView(
+      VIEW_TYPE_BIBTEX_CITATION,
+      (leaf: WorkspaceLeaf) => new BibPanelView(leaf, this),
+    );
+
+    this.registerEvent(
+      this.events.on('library-load-complete', () => {
+        this.refreshDerivedEntries();
+      }),
+    );
+
+    this.registerEvent(
+      this.app.workspace.on('active-leaf-change', (leaf) => {
+        const view = leaf?.view;
+        if (view instanceof MarkdownView) {
+          this.lastMarkdownView = view;
+        }
+      }),
+    );
+
+    this.addRibbonIcon('library', this.texts.sidebar.title, () => {
+      this.activatePanel();
+    });
+
+    // 命令统一不带默认快捷键，仅保留在命令面板中
     this.addCommand({
       id: 'open-literature-note',
       name: 'Open literature note',
-      hotkeys: [{ modifiers: ['Ctrl', 'Shift'], key: 'o' }],
       callback: () => {
         const modal = new OpenNoteModal(this.app, this);
-        modal.open();
-      },
-    });
-
-    this.addCommand({
-      id: 'update-bib-data',
-      name: 'Refresh citation database',
-      hotkeys: [{ modifiers: ['Ctrl', 'Shift'], key: 'r' }],
-      callback: () => {
-        this.loadLibrary();
-      },
-    });
-
-    this.addCommand({
-      id: 'insert-citation',
-      name: 'Insert literature note link',
-      hotkeys: [{ modifiers: ['Ctrl', 'Shift'], key: 'e' }],
-      callback: () => {
-        const modal = new InsertNoteLinkModal(this.app, this);
         modal.open();
       },
     });
@@ -172,15 +234,60 @@ export default class CitationPlugin extends Plugin {
     });
 
     this.addCommand({
-      id: 'insert-markdown-citation',
-      name: 'Insert Markdown citation',
-      callback: () => {
-        const modal = new InsertCitationModal(this.app, this);
-        modal.open();
-      },
+      id: 'bibtex-insert-citation',
+      name: this.texts.commands.insertCitation,
+      callback: () => insertCitationCommand(this),
+    });
+
+    this.addCommand({
+      id: 'bibtex-refresh-cache',
+      name: this.texts.commands.refreshCache,
+      callback: () => refreshCacheCommand(this),
+    });
+
+    this.addCommand({
+      id: 'bibtex-render-citations',
+      name: this.texts.commands.renderCitations,
+      callback: () => renderCitationsCommand(this),
+    });
+
+    this.addCommand({
+      id: 'bibtex-restore-citations',
+      name: this.texts.commands.restoreCitations,
+      callback: () => restoreCitationsCommand(this),
+    });
+
+    this.addCommand({
+      id: 'bibtex-upsert-bibliography',
+      name: this.texts.commands.upsertBibliography,
+      callback: () => upsertBibliographyCommand(this),
+    });
+
+    this.addCommand({
+      id: 'bibtex-remove-bibliography',
+      name: this.texts.commands.removeBibliography,
+      callback: () => removeBibliographyCommand(this),
+    });
+
+    this.addCommand({
+      id: 'bibtex-toggle-panel',
+      name: this.texts.sidebar.title,
+      callback: () => this.activatePanel(),
     });
 
     this.addSettingTab(new CitationSettingTab(this.app, this));
+  }
+
+  activatePanel(): void {
+    const { workspace } = this.app;
+    const existing = workspace.getLeavesOfType(VIEW_TYPE_BIBTEX_CITATION);
+    const leaf =
+      existing[0] ??
+      workspace.getRightLeaf(false) ??
+      workspace.getLeaf(true);
+    if (!leaf) return;
+    leaf.setViewState({ type: VIEW_TYPE_BIBTEX_CITATION, active: true });
+    workspace.revealLeaf(leaf);
   }
 
   /**
@@ -218,27 +325,17 @@ export default class CitationPlugin extends Plugin {
 
           return this.loadWorker.post({
             databaseRaw: value,
-            databaseType: this.settings.citationExportFormat,
+            // 仅支持 BibLaTeX（.bib）；不再支持 CSL-JSON 库
+            databaseType: 'biblatex' as const,
           });
         })
-        .then((entries: EntryData[]) => {
-          let adapter: new (data: EntryData) => Entry;
-          let idKey: string;
-
-          switch (this.settings.citationExportFormat) {
-            case 'biblatex':
-              adapter = EntryBibLaTeXAdapter;
-              idKey = 'key';
-              break;
-            case 'csl-json':
-              adapter = EntryCSLAdapter;
-              idKey = 'id';
-              break;
-          }
-
+        .then((entries: EntryDataBibLaTeX[]) => {
           this.library = new Library(
             Object.fromEntries(
-              entries.map((e) => [(e as IIndexable)[idKey], new adapter(e)]),
+              entries.map(
+                (e) =>
+                  [(e as IIndexable).key, new EntryBibLaTeXAdapter(e)] as const,
+              ),
             ),
           );
           console.debug(
@@ -289,20 +386,6 @@ export default class CitationPlugin extends Plugin {
     );
   }
 
-  get markdownCitationTemplate(): Template {
-    return compileTemplate(
-      this.settings.markdownCitationTemplate,
-      this.templateSettings,
-    );
-  }
-
-  get alternativeMarkdownCitationTemplate(): Template {
-    return compileTemplate(
-      this.settings.alternativeMarkdownCitationTemplate,
-      this.templateSettings,
-    );
-  }
-
   getTitleForCitekey(citekey: string): string {
     const unsafeTitle = this.literatureNoteTitleTemplate(
       this.library.getTemplateVariablesForCitekey(citekey),
@@ -318,18 +401,6 @@ export default class CitationPlugin extends Plugin {
 
   getInitialContentForCitekey(citekey: string): string {
     return this.literatureNoteContentTemplate(
-      this.library.getTemplateVariablesForCitekey(citekey),
-    );
-  }
-
-  getMarkdownCitationForCitekey(citekey: string): string {
-    return this.markdownCitationTemplate(
-      this.library.getTemplateVariablesForCitekey(citekey),
-    );
-  }
-
-  getAlternativeMarkdownCitationForCitekey(citekey: string): string {
-    return this.alternativeMarkdownCitationTemplate(
       this.library.getTemplateVariablesForCitekey(citekey),
     );
   }
@@ -374,29 +445,6 @@ export default class CitationPlugin extends Plugin {
       .catch(console.error);
   }
 
-  async insertLiteratureNoteLink(citekey: string): Promise<void> {
-    this.getOrCreateLiteratureNoteFile(citekey)
-      .then((file: TFile) => {
-        const useMarkdown: boolean = (<VaultExt>this.app.vault).getConfig(
-          'useMarkdownLinks',
-        );
-        const title = this.getTitleForCitekey(citekey);
-
-        let linkText: string;
-        if (useMarkdown) {
-          const uri = encodeURI(
-            this.app.metadataCache.fileToLinktext(file, '', false),
-          );
-          linkText = `[${title}](${uri})`;
-        } else {
-          linkText = `[[${title}]]`;
-        }
-
-        this.editor.replaceSelection(linkText);
-      })
-      .catch(console.error);
-  }
-
   /**
    * Format literature note content for a given reference and insert in the
    * currently active pane.
@@ -404,17 +452,5 @@ export default class CitationPlugin extends Plugin {
   async insertLiteratureNoteContent(citekey: string): Promise<void> {
     const content = this.getInitialContentForCitekey(citekey);
     this.editor.replaceRange(content, this.editor.getCursor());
-  }
-
-  async insertMarkdownCitation(
-    citekey: string,
-    alternative = false,
-  ): Promise<void> {
-    const func = alternative
-      ? this.getAlternativeMarkdownCitationForCitekey
-      : this.getMarkdownCitationForCitekey;
-    const citation = func.bind(this)(citekey);
-
-    this.editor.replaceRange(citation, this.editor.getCursor());
   }
 }

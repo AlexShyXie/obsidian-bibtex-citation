@@ -8,16 +8,10 @@ import {
 } from 'obsidian';
 
 import CitationPlugin from './main';
-import { IIndexable, DatabaseType, TEMPLATE_VARIABLES } from './types';
-
-const CITATION_DATABASE_FORMAT_LABELS: Record<DatabaseType, string> = {
-  'csl-json': 'CSL-JSON',
-  biblatex: 'BibLaTeX',
-};
+import { IIndexable, TEMPLATE_VARIABLES } from './types';
 
 export class CitationsPluginSettings {
   public citationExportPath: string;
-  citationExportFormat: DatabaseType = 'csl-json';
 
   literatureNoteTitleTemplate = '@{{citekey}}';
   literatureNoteFolder = 'Reading notes';
@@ -28,8 +22,8 @@ export class CitationsPluginSettings {
     'year: {{year}}\n' +
     '---\n\n';
 
-  markdownCitationTemplate = '[@{{citekey}}]';
-  alternativeMarkdownCitationTemplate = '@{{citekey}}';
+  /** BibTeX Citations（Typora 版迁移）：CSL 样式文件路径（绝对路径或 vault 相对路径） */
+  cslFilePath = '';
 }
 
 export class CitationSettingTab extends PluginSettingTab {
@@ -42,13 +36,6 @@ export class CitationSettingTab extends PluginSettingTab {
   constructor(app: App, plugin: CitationPlugin) {
     super(app, plugin);
     this.plugin = plugin;
-  }
-
-  open(): void {
-    super.open();
-    this.checkCitationExportPath(
-      this.plugin.settings.citationExportPath,
-    ).then(() => this.showCitationExportPathSuccess());
   }
 
   addValueChangeCallback<T extends HTMLTextAreaElement | HTMLInputElement>(
@@ -82,30 +69,6 @@ export class CitationSettingTab extends PluginSettingTab {
     containerEl.setAttr('id', 'zoteroSettingTab');
 
     containerEl.createEl('h2', { text: 'Citation plugin settings' });
-
-    new Setting(containerEl)
-      .setName('Citation database format')
-      .addDropdown((component) =>
-        this.buildValueInput(
-          component.addOptions(CITATION_DATABASE_FORMAT_LABELS),
-          'citationExportFormat',
-          (value) => {
-            this.checkCitationExportPath(
-              this.plugin.settings.citationExportPath,
-            ).then((success) => {
-              if (success) {
-                this.citationPathSuccessEl.addClass('d-none');
-                this.citationPathLoadingEl.removeClass('d-none');
-
-                this.plugin.loadLibrary().then(() => {
-                  this.citationPathLoadingEl.addClass('d-none');
-                  this.showCitationExportPathSuccess();
-                });
-              }
-            });
-          },
-        ),
-      );
 
     // NB: we force reload of the library on path change.
     new Setting(containerEl)
@@ -144,6 +107,19 @@ export class CitationSettingTab extends PluginSettingTab {
       cls: 'zoteroSettingCitationPathSuccess d-none',
       text: 'Loaded library with {{n}} references.',
     });
+
+    new Setting(containerEl)
+      .setName('CSL style file (BibTeX Citations)')
+      .setDesc(
+        'Path to a .csl style file used for citation rendering. ' +
+          'Can be an absolute path or a path relative to the current vault root folder.',
+      )
+      .addText((input) =>
+        this.buildValueInput(
+          input.setPlaceholder('/path/to/style.csl'),
+          'cslFilePath',
+        ),
+      );
 
     new Setting(containerEl)
       .setName('Literature note folder')
@@ -219,24 +195,6 @@ export class CitationSettingTab extends PluginSettingTab {
       .setName('Literature note content template')
       .addTextArea((input) =>
         this.buildValueInput(input, 'literatureNoteContentTemplate'),
-      );
-
-    containerEl.createEl('h3', { text: 'Markdown citation templates' });
-    containerEl.createEl('p', {
-      text:
-        'You can insert Pandoc-style Markdown citations rather than literature notes by using the "Insert Markdown citation" command. The below options allow customization of the Markdown citation format.',
-    });
-
-    new Setting(containerEl)
-      .setName('Markdown primary citation template')
-      .addText((input) =>
-        this.buildValueInput(input, 'markdownCitationTemplate'),
-      );
-
-    new Setting(containerEl)
-      .setName('Markdown secondary citation template')
-      .addText((input) =>
-        this.buildValueInput(input, 'alternativeMarkdownCitationTemplate'),
       );
   }
 
