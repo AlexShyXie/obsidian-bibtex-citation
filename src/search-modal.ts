@@ -39,9 +39,10 @@ export class BibSearchModal extends SuggestModal<InternalBibEntry> {
       .setText(this.plugin.texts.commands.searchEmpty);
   }
 
-  onChooseSuggestion(item: InternalBibEntry, _evt: MouseEvent | KeyboardEvent): void {
-    const view = this.plugin.activeEditorView();
-    if (!view) {
+  async onChooseSuggestion(item: InternalBibEntry, _evt: MouseEvent | KeyboardEvent): Promise<void> {
+    // 阅读模式下无法插入：先切到编辑（实时预览）模式
+    const view = await this.plugin.ensureEditingView();
+    if (!view?.editor) {
       new Notice(this.plugin.texts.commands.insertUnavailable);
       return;
     }

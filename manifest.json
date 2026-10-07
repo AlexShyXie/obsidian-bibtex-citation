@@ -1,7 +1,7 @@
 {
 	"id": "bibtex-citation",
 	"name": "BibTeX Citations",
-	"version": "1.0.3",
+	"version": "0.4.7",
 	"minAppVersion": "1.2.0",
 	"description": "Pandoc-style BibTeX citations with CSL rendering, @-suggest, and a right sidebar. Typora bibtex-citation features migrated onto the Citations plugin.",
 	"author": "AlexShyXie",

@@ -82,6 +82,24 @@ export class BibPanelView extends ItemView {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
   }
 
+  /**
+   * 读取当前文档内容用于概览统计：
+   * 优先编辑器（含未保存改动），阅读模式下编辑器不可用时回退读文件（只读，不切换模式）。
+   */
+  private async readCurrentMarkdown(): Promise<string> {
+    const fromEditor = this.plugin.activeEditorView()?.editor?.getValue();
+    if (fromEditor != null) return fromEditor;
+
+    const file = this.app.workspace.getActiveFile();
+    if (!file) return '';
+    try {
+      return await this.app.vault.cachedRead(file);
+    } catch (error) {
+      console.error('[bibtex-citation] failed to read current file:', error);
+      return '';
+    }
+  }
+
   private addSummaryRow(summary: HTMLElement, label: string): HTMLElement {
     const row = summary.createDiv({ cls: 'bibtex-sidebar-summary-row' });
     row.createEl('dt', { text: label });
@@ -115,10 +133,10 @@ export class BibPanelView extends ItemView {
 
   refreshSummary(): void {
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
-    this.refreshTimer = setTimeout(() => this.doRefresh(), 300);
+    this.refreshTimer = setTimeout(() => void this.doRefresh(), 300);
   }
 
-  private doRefresh(): void {
+  private async doRefresh(): Promise<void> {
     const t = this.plugin.texts;
 
     const cslPath = String(this.plugin.settings.cslFilePath || '').trim();
@@ -129,7 +147,7 @@ export class BibPanelView extends ItemView {
       entries.length ? String(entries.length) : t.sidebar.unavailable,
     );
 
-    const markdown = this.plugin.activeEditorView()?.editor.getValue() ?? '';
+    const markdown = await this.readCurrentMarkdown();
     const state = this.plugin.getDocumentCitationState(markdown);
     if (state.error) {
       this.errorEl.setText(

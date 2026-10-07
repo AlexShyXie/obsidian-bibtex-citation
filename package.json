@@ -1,7 +1,7 @@
 {
   "name": "obsidian-citation-plugin",
-  "version": "0.4.5",
-  "description": "Automatically search and insert citations from a Zotero library",
+  "version": "0.4.7",
+  "description": "Automatically search and insert citations from a bibtex library",
   "main": "main.js",
   "scripts": {
     "dev": "rollup --config rollup.config.js -w",

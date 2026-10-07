@@ -3,8 +3,10 @@ import {
   FileSystemAdapter,
   MarkdownView,
   normalizePath,
+  Notice,
   Plugin,
   TFile,
+  ViewState,
   WorkspaceLeaf,
 } from 'obsidian';
 import * as path from 'path';
@@ -47,6 +49,35 @@ import {
   WorkerManagerBlocked,
 } from './util';
 import LoadWorker from 'web-worker:./worker';
+
+/**
+ * MarkdownView.getMode() 在部分 Obsidian 版本的类型定义中未必声明，统一做防御式访问。
+ */
+type MarkdownViewWithMode = MarkdownView & {
+  getMode?: () => string;
+};
+
+/**
+ * 一次文档级编辑的上下文：记录是否由阅读模式临时切换而来，
+ * 便于改写结束后落盘并恢复原阅读模式。
+ */
+export interface EditingSession {
+  view: MarkdownView | null;
+  file: TFile | null;
+  /** 本次是否由阅读模式临时切到了编辑模式 */
+  switchedFromPreview: boolean;
+  /** 结束编辑：落盘并在需要时切回阅读模式 */
+  finish: () => Promise<void>;
+}
+
+/** 判断视图是否处于阅读模式；无法判定模式时以编辑器是否可用兜底 */
+function isPreviewMode(view: MarkdownView): boolean {
+  const getMode = (view as MarkdownViewWithMode).getMode;
+  if (typeof getMode === 'function') {
+    return getMode.call(view) === 'preview';
+  }
+  return !view.editor;
+}
 
 export default class CitationPlugin extends Plugin {
   settings: CitationsPluginSettings;
@@ -116,6 +147,96 @@ export default class CitationPlugin extends Plugin {
   }
 
   private lastMarkdownView: MarkdownView | null = null;
+
+  /**
+   * 取当前可用的 Markdown 视图，并在其处于阅读模式时切到编辑（实时预览）模式。
+   * 阅读模式下插件无法改写笔记，故所有写操作入口都应先调用本方法。
+   * 已是源码/实时预览模式时原样返回，避免不必要的视图重建。
+   */
+  async ensureEditingView(): Promise<MarkdownView | null> {
+    const view = this.activeEditorView();
+    if (!view) return null;
+
+    // 已是可编辑状态（源码/实时预览且编辑器可用）时原样返回，不做任何视图操作
+    if (!isPreviewMode(view) && view.editor) return view;
+
+    const leaf = view.leaf;
+    if (!leaf) return view;
+
+    try {
+      // 与成熟的阅读模式切换实现保持一致：只 spread 原 viewState，
+      // 不覆盖 view type、不额外设置 active、不调用内部 setMode，避免破坏 leaf 造成白屏。
+      const viewState: ViewState = leaf.getViewState();
+      const state = viewState.state ?? {};
+      if (state.mode !== 'preview') return view;
+
+      await leaf.setViewState({
+        ...viewState,
+        state: { ...state, mode: 'source', source: false },
+      });
+
+      // 切换后视图实例可能重建，重新取一次
+      const newView = leaf.view;
+      const result = newView instanceof MarkdownView ? newView : view;
+      this.lastMarkdownView = result;
+      return result;
+    } catch (error) {
+      console.error('[bibtex-citation] failed to switch to editing mode:', error);
+      return view;
+    }
+  }
+
+  /**
+   * 开启一次文档级编辑：原本处于阅读模式时临时切到编辑模式，
+   * 改写完成后调用 finish() 落盘并切回阅读模式；原本就是编辑模式时 finish() 为空操作。
+   */
+  async beginEditingSession(): Promise<EditingSession> {
+    const origin = this.activeEditorView();
+    if (!origin) {
+      return {
+        view: null,
+        file: null,
+        switchedFromPreview: false,
+        finish: async () => undefined,
+      };
+    }
+
+    const leaf = origin.leaf;
+    const wasPreview = isPreviewMode(origin);
+    const view = await this.ensureEditingView();
+    const switchedFromPreview = wasPreview && view !== null;
+
+    return {
+      view,
+      file: view?.file ?? null,
+      switchedFromPreview,
+      finish: async () => {
+        if (!switchedFromPreview || !leaf) return;
+        try {
+          // 切回阅读模式前先把编辑器内容落盘，避免改写只停留在内存中
+          const file = view?.file ?? null;
+          if (file && view?.editor) {
+            await this.app.vault.modify(file, view.editor.getValue());
+          }
+
+          // 同样只 spread 当前 viewState：不覆盖 view type、不额外设置 active
+          const currentState: ViewState = leaf.getViewState();
+          await leaf.setViewState({
+            ...currentState,
+            state: { ...(currentState.state ?? {}), mode: 'preview' },
+          });
+
+          const restored = leaf.view;
+          if (restored instanceof MarkdownView) {
+            this.lastMarkdownView = restored;
+          }
+        } catch (error) {
+          // 恢复失败不影响已经完成的文档改写，仅记录日志
+          console.error('[bibtex-citation] failed to restore reading mode:', error);
+        }
+      },
+    };
+  }
 
   getDocumentCitationState(markdown: string): {
     counts: { unique: number; total: number };
@@ -450,7 +571,12 @@ export default class CitationPlugin extends Plugin {
    * currently active pane.
    */
   async insertLiteratureNoteContent(citekey: string): Promise<void> {
+    const view = await this.ensureEditingView();
+    if (!view?.editor) {
+      new Notice(this.texts.commands.insertUnavailable);
+      return;
+    }
     const content = this.getInitialContentForCitekey(citekey);
-    this.editor.replaceRange(content, this.editor.getCursor());
+    view.editor.replaceRange(content, view.editor.getCursor());
   }
 }

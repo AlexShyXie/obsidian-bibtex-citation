@@ -1,4 +1,4 @@
-import { Editor, EditorPosition, Notice } from 'obsidian';
+import { Editor, EditorPosition, Notice, TFile } from 'obsidian';
 import * as fs from 'fs';
 
 import CitationPlugin from './main';
@@ -19,10 +19,6 @@ import { BibCitationTexts } from './v3/i18n';
 export interface DocumentActionResult {
   changed: boolean;
   message: string;
-}
-
-function getActiveEditor(plugin: CitationPlugin): Editor | null {
-  return plugin.activeEditorView()?.editor ?? null;
 }
 
 function offsetOf(editor: Editor, pos: EditorPosition): number {
@@ -49,44 +45,59 @@ async function runDocumentAction(
   },
 ): Promise<void> {
   const t = plugin.texts;
+  // 原本是阅读模式时先切到编辑模式，结束后在 finally 中落盘并切回阅读模式
+  const session = await plugin.beginEditingSession();
   try {
-    const editor = getActiveEditor(plugin);
-    if (!editor) {
+    const editor = session.view?.editor ?? null;
+    const file = session.file ?? plugin.app.workspace.getActiveFile();
+    if (!editor && !file) {
       new Notice(t.commands.insertUnavailable);
       return;
     }
 
     const entries = plugin.getInternalBibEntries();
-    const result = config.act(editor.getValue(), entries);
+    // 编辑器可用时以其内容为准（含未保存改动），否则回退读文件内容
+    const source = editor
+      ? editor.getValue()
+      : await plugin.app.vault.cachedRead(file as TFile);
+    const result = config.act(source, entries);
     if (!result.changed || result.markdown == null) {
       new Notice(config.formatNoChanges(t));
       return;
     }
 
-    const offset = offsetOf(editor, editor.getCursor());
-    editor.setValue(result.markdown);
-    // 尝试恢复光标：文档前缀通常不变，按原偏移近似还原。
-    // 注意 Windows 文档为 CRLF 时，CM6 内部按 \n 计长，与 getValue() 的
-    // 字符长度不一致，clamp 必须按规范化后的长度；兜底失败则退到文末。
-    const normalizedLength = editor
-      .getValue()
-      .replace(/\r\n/g, '\n').length;
-    try {
-      editor.setCursor(editor.offsetToPos(Math.min(offset, normalizedLength)));
-    } catch {
+    if (editor) {
+      const offset = offsetOf(editor, editor.getCursor());
+      editor.setValue(result.markdown);
+      // 尝试恢复光标：文档前缀通常不变，按原偏移近似还原。
+      // 注意 Windows 文档为 CRLF 时，CM6 内部按 \n 计长，与 getValue() 的
+      // 字符长度不一致，clamp 必须按规范化后的长度；兜底失败则退到文末。
+      const normalizedLength = editor
+        .getValue()
+        .replace(/\r\n/g, '\n').length;
       try {
-        const lastLine = editor.lastLine();
-        const safeCh = Math.max(0, (editor.getLine(lastLine) || '').length - 1);
-        editor.setCursor({ line: lastLine, ch: safeCh });
+        editor.setCursor(editor.offsetToPos(Math.min(offset, normalizedLength)));
       } catch {
-        // 光标恢复失败不影响文档改写结果
+        try {
+          const lastLine = editor.lastLine();
+          const safeCh = Math.max(0, (editor.getLine(lastLine) || '').length - 1);
+          editor.setCursor({ line: lastLine, ch: safeCh });
+        } catch {
+          // 光标恢复失败不影响文档改写结果
+        }
       }
+    } else {
+      // 仍然停留在阅读模式/编辑器不可用时，直接写文件，保证改动生效
+      await plugin.app.vault.modify(file as TFile, result.markdown);
     }
 
     new Notice(config.formatSuccess(t, result));
   } catch (error) {
     console.error('[bibtex-citation] document action failed:', error);
     new Notice(`${config.formatErrorPrefix(t)}${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    // 无论成功、无改动还是出错，都要把临时切过来的阅读模式恢复回去
+    await session.finish();
   }
 }
 
